@@ -46,6 +46,22 @@ def run_command_streaming(cmd, env=None, job_id="BUILD"):
     return_code = process.wait()
     return return_code, "".join(output_lines)
 
+# --- Hardware Detection Helpers ---
+def get_memory_info():
+    try:
+        with open('/sys/fs/cgroup/memory.max', 'r') as f:
+            val = f.read().strip()
+            if val != 'max':
+                return int(val) / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        pages = os.sysconf('SC_PHYS_PAGES')
+        page_size = os.sysconf('SC_PAGE_SIZE')
+        return (pages * page_size) / (1024 ** 3)
+    except Exception:
+        return 4.0
+
 # --- The Main Handler ---
 def handler(job):
     job_id = job.get('id', 'unknown')
@@ -92,12 +108,20 @@ def handler(job):
     full_image_tag = f"{dockerhub_repo}:{dockerhub_tag}"
     
     # ---------------------------------------------------------
-    # WORKSPACE PREPARATION (Inside the Shield)
+    # WORKSPACE PREPARATION (The "Warp Drive" Optimization)
     # ---------------------------------------------------------
+    actual_ram_gb = get_memory_info()
     shield_workspace = "/__runpod_shield__/workspace"
-    os.makedirs(shield_workspace, exist_ok=True)
     
-    log(f"Preparing workspace in {shield_workspace}...", job_id=job_id)
+    # If we have 30GB+ RAM, move the entire build workspace to RAM Disk (/dev/shm)
+    # This makes Kaniko's snapshotting and extraction phases near-instant.
+    if actual_ram_gb >= 30.0:
+        log(f"High RAM detected ({actual_ram_gb:.1f}GB). Activating Warp Drive (RAM Disk)...", job_id=job_id)
+        shield_workspace = "/dev/shm/runpod_build"
+    else:
+        log(f"Standard RAM detected ({actual_ram_gb:.1f}GB). Using persistent storage.", job_id=job_id)
+
+    os.makedirs(shield_workspace, exist_ok=True)
     
     with tempfile.TemporaryDirectory(dir=shield_workspace) as tmp_dir:
         repo_dir = os.path.join(tmp_dir, "repo")
@@ -105,7 +129,6 @@ def handler(job):
             
         log(f"Cloning repository...", job_id=job_id)
         try:
-            # OPTIMIZATION: Shallow clone (depth=1) speeds up download significantly
             Repo.clone_from(clone_url, repo_dir, branch=branch, depth=1)
             log("Clone successful.", job_id=job_id)
         except Exception as e:
@@ -119,7 +142,6 @@ def handler(job):
         # ENVIRONMENT ROUTING
         # ---------------------------------------------------------
         
-        # Check for the updated kaniko-engine path
         if os.path.exists("/kaniko-engine/executor"):
             log("Production environment (Shielded Kaniko) detected.", job_id=job_id)
             
@@ -134,9 +156,11 @@ def handler(job):
                 with open(os.path.join(docker_config_dir, "config.json"), "w") as f:
                     json.dump(config_data, f)
             
-            # OPTIMIZATION: Hardcoded for known hardware environment
-            cpu_count = 16
-            log(f"Allocating {cpu_count} vCPUs for the build pipeline.", job_id=job_id)
+            cpu_count = 16 # Optimized for 16/32 hardware
+            
+            # Persistent Cache Directory (if volume is mounted to /__runpod_shield__)
+            cache_dir = "/__runpod_shield__/cache"
+            os.makedirs(cache_dir, exist_ok=True)
             
             kaniko_cmd = [
                 "/kaniko-engine/executor",
@@ -147,10 +171,14 @@ def handler(job):
                 "--compressed-caching=false", 
                 "--ignore-path=/__runpod_shield__", 
                 "--ignore-path=/kaniko-engine", 
+                "--ignore-path=/dev/shm",
                 "--build-arg", f"MAKEFLAGS=-j{cpu_count}",
                 "--build-arg", f"NPROC={cpu_count}",
                 "--build-arg", f"MAX_JOBS={cpu_count}",
-                "--snapshot-mode=redo"
+                "--snapshot-mode=redo",
+                "--cache=true",
+                f"--cache-dir={cache_dir}",
+                "--cache-ttl=24h"
             ]
             
             env = os.environ.copy()
@@ -158,8 +186,10 @@ def handler(job):
             env["GOMAXPROCS"] = str(cpu_count)
             env["GOGC"] = "1000"
             env["GOMEMLIMIT"] = "28000MiB"
+            # Optimization: Force HF Transfer if not explicitly disabled
+            env["HF_HUB_ENABLE_HF_TRANSFER"] = "1" 
 
-            log("Starting Kaniko build/push process...", job_id=job_id)
+            log("Starting Optimized Kaniko build...", job_id=job_id)
             rc, build_log = run_command_streaming(kaniko_cmd, env=env, job_id=job_id)
             
             if rc != 0:

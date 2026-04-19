@@ -1,9 +1,35 @@
 import os
+import shutil
+
+# ═══════════════════════════════════════════════════════════════════
+# LIFELINE BOOTSTRAP — MUST RUN BEFORE `import runpod`
+# ═══════════════════════════════════════════════════════════════════
+# The runpod SDK spawns rp_ping as a multiprocessing.Process. On fork,
+# that child receives a FROZEN SNAPSHOT of os.environ. If we wait until
+# inside handler() to redirect REQUESTS_CA_BUNDLE, the ping subprocess
+# has already cached the Dockerfile's /__runpod_shield__/cacert.pem path
+# and will crash the moment Kaniko wipes that directory.
+#
+# By copying the cert to /tmp and rewriting the env vars HERE — before
+# the SDK forks anything — the ping process inherits the survivable path.
+# ═══════════════════════════════════════════════════════════════════
+_CERT_LIFELINE = "/tmp/cacert.pem"
+if not os.path.exists(_CERT_LIFELINE):
+    for _src in ("/__runpod_shield__/cacert.pem",
+                 "/etc/ssl/certs/ca-certificates.crt"):
+        if os.path.exists(_src):
+            shutil.copy(_src, _CERT_LIFELINE)
+            break
+
+os.environ["REQUESTS_CA_BUNDLE"] = _CERT_LIFELINE
+os.environ["SSL_CERT_FILE"]      = _CERT_LIFELINE
+os.environ["CURL_CA_BUNDLE"]     = _CERT_LIFELINE  # belt-and-suspenders
+
+# Now — and ONLY now — is it safe to import the RunPod SDK.
 import subprocess
 import tempfile
 import base64
 import json
-import shutil
 import time
 import threading
 import runpod

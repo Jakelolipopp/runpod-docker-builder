@@ -10,12 +10,6 @@ import runpod
 from git import Repo
 
 # ---------------------------------------------------------------------------
-# CONSTANTS
-# ---------------------------------------------------------------------------
-KANIKO_EXECUTOR = "/kaniko/executor"             # Updated path
-KANIKO_GHOST    = "/tmp/kaniko-ghost-executor"   # Run from here to free the destination path
-
-# ---------------------------------------------------------------------------
 # HARDWARE PROFILING
 # ---------------------------------------------------------------------------
 
@@ -79,53 +73,45 @@ def parse_pat_env(env_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# KANIKO GHOST: copy executor to /tmp so the destination path is writable
+# KANIKO BUILD (Production via chroot Jail)
 # ---------------------------------------------------------------------------
 
-def prepare_kaniko_ghost() -> str:
-    """
-    Copies the Kaniko executor to /tmp so the kernel ETXTBSY lock
-    doesn't fire when a Dockerfile tries to write to the same path
-    the currently-executing binary lives at.
-    Returns the path to the ghost binary.
-    """
-    if not os.path.exists(KANIKO_GHOST):
-        shutil.copy2(KANIKO_EXECUTOR, KANIKO_GHOST)
-        os.chmod(KANIKO_GHOST, 0o755)
-    return KANIKO_GHOST
-
-
-# ---------------------------------------------------------------------------
-# KANIKO BUILD (Production)
-# ---------------------------------------------------------------------------
-
-def run_kaniko(
-    context_path:    str,
+def run_kaniko_jailed(
+    repo_dir:        str,
+    build_ctx_path:  str,
     dockerfile_path: str,
     destination:     str,
     docker_config:   str,
     profile:         dict,
 ) -> subprocess.CompletedProcess:
     """
-    Invokes Kaniko with --kaniko-dir=/tmp/kaniko-run so that ALL layer
-    extraction and snapshotting happens inside /tmp — never touching the
-    live host OS filesystem.
+    Executes Kaniko inside a chroot jail. This physically isolates Kaniko 
+    from the Python environment, preventing file locks and bad snapshots.
     """
-    ghost = prepare_kaniko_ghost()
+    jail_root = "/kaniko-jail"
+    jail_workspace = f"{jail_root}/workspace"
 
-    # Kaniko's entire working universe lives here.
-    # Because /tmp is also where our workspace and ghost binary live,
-    # --ignore-path=/tmp tells Kaniko not to snapshot /tmp into the image.
-    kaniko_work_dir = "/tmp/kaniko-run"
-    os.makedirs(kaniko_work_dir, exist_ok=True)
+    # 1. Clear previous workspace and copy the new repo into the jail
+    shutil.rmtree(jail_workspace, ignore_errors=True)
+    shutil.copytree(repo_dir, jail_workspace)
 
+    # 2. Copy Docker auth into the jail so Kaniko can authenticate
+    jail_docker_cfg = f"{jail_root}/kaniko/.docker"
+    os.makedirs(jail_docker_cfg, exist_ok=True)
+    shutil.copy(os.path.join(docker_config, "config.json"), os.path.join(jail_docker_cfg, "config.json"))
+
+    # 3. Resolve paths relative to the INSIDE of the chroot jail.
+    # The `repo_dir` was copied to `/workspace` inside the jail.
+    chroot_ctx        = os.path.normpath(f"/workspace/{build_ctx_path}")
+    chroot_dockerfile = os.path.normpath(f"/workspace/{dockerfile_path}")
+
+    # 4. Execute Kaniko inside the chroot jail.
     cmd = [
-        ghost,
-        "--context",        context_path,
-        "--dockerfile",     dockerfile_path,
+        "chroot", jail_root,
+        "/kaniko/executor",
+        "--context",        chroot_ctx,
+        "--dockerfile",     chroot_dockerfile,
         "--destination",    destination,
-        "--kaniko-dir",     kaniko_work_dir,   # ← THE KEY FLAG
-        "--ignore-path",    "/tmp",            # don't snapshot our workspace into the image
         f"--snapshot-mode={profile['snapshot_mode']}",
         "--compressed-caching=false",
         "--build-arg", f"MAKEFLAGS=-j{profile['threads']}",
@@ -135,8 +121,7 @@ def run_kaniko(
     ]
 
     env = os.environ.copy()
-    env["DOCKER_CONFIG"] = docker_config
-    env["GOMAXPROCS"]    = str(profile["threads"])
+    env["GOMAXPROCS"] = str(profile["threads"])
 
     return subprocess.run(cmd, env=env, capture_output=True, text=True)
 
@@ -206,7 +191,7 @@ def handler(job: dict) -> dict:
 
     destination = f"{dockerhub_repo}:{dockerhub_tag}"
 
-    # ── Clone repo into /tmp ──────────────────────────────────────────────────
+    # ── Clone repo to a temp workspace ────────────────────────────────────────
     work_root = "/tmp/builder_workspace"
     os.makedirs(work_root, exist_ok=True)
 
@@ -224,11 +209,9 @@ def handler(job: dict) -> dict:
         except Exception as exc:
             return {"error": f"Clone failed: {exc}"}
 
-        abs_ctx        = os.path.abspath(os.path.join(repo_dir, build_ctx_path))
-        abs_dockerfile = os.path.abspath(os.path.join(repo_dir, dockerfile_path))
-
-        # ── Route: Production (Kaniko) vs Local (Docker) ─────────────────────
-        is_production = os.path.exists(KANIKO_EXECUTOR)
+        # ── Route: Production (Kaniko chroot) vs Local (Docker) ──────────────
+        # We check for the jail root rather than just the binary now
+        is_production = os.path.exists("/kaniko-jail")
 
         if is_production:
             # ── Hardware profiling ────────────────────────────────────────────
@@ -251,8 +234,17 @@ def handler(job: dict) -> dict:
                     json.dump(cfg, f)
 
             # ── Build ─────────────────────────────────────────────────────────
-            print(f"[build] {destination}")
-            result = run_kaniko(abs_ctx, abs_dockerfile, destination, docker_cfg_dir, profile)
+            print(f"[build] {destination} via Kaniko Jail")
+            
+            # Pass the relative strings, let run_kaniko_jailed map them to the chroot
+            result = run_kaniko_jailed(
+                repo_dir=repo_dir,
+                build_ctx_path=build_ctx_path,
+                dockerfile_path=dockerfile_path,
+                destination=destination,
+                docker_config=docker_cfg_dir,
+                profile=profile
+            )
 
             if result.returncode != 0:
                 return {
@@ -262,9 +254,8 @@ def handler(job: dict) -> dict:
                     "stderr":  result.stderr,
                 }
 
-            # Clean up Kaniko's work dir so the next job starts fresh in /tmp
-            shutil.rmtree("/tmp/kaniko-run", ignore_errors=True)
-            shutil.rmtree("/tmp/kaniko-ghost-executor", ignore_errors=True)
+            # Clean up the jail workspace to free up disk space immediately
+            shutil.rmtree("/kaniko-jail/workspace", ignore_errors=True)
 
             return {
                 "success":   True,
@@ -275,9 +266,11 @@ def handler(job: dict) -> dict:
         else:
             # ── Local Docker fallback ─────────────────────────────────────────
             if not shutil.which("docker"):
-                return {"success": False, "error": "Neither Kaniko nor Docker found."}
+                return {"success": False, "error": "Neither Kaniko Jail nor Docker found."}
 
             print("[local] Falling back to host Docker daemon")
+            abs_ctx        = os.path.abspath(os.path.join(repo_dir, build_ctx_path))
+            abs_dockerfile = os.path.abspath(os.path.join(repo_dir, dockerfile_path))
             return run_local_docker(abs_ctx, abs_dockerfile, destination, dh_user, dh_token)
 
 
@@ -286,5 +279,5 @@ def handler(job: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("RunPod Docker Auto-Builder Worker v3 — starting.")
+    print("RunPod Docker Auto-Builder Worker v4 (Jailed) — starting.")
     runpod.serverless.start({"handler": handler})

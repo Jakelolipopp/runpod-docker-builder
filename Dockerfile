@@ -7,14 +7,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Copy the ENTIRE Kaniko directory (fixes the lstat error and brings SSL certs)
-COPY --from=kaniko /kaniko /kaniko
+# 2. Build the Kaniko Jail
+RUN mkdir -p /kaniko-jail/workspace /kaniko-jail/tmp /kaniko-jail/etc
+COPY --from=kaniko /kaniko /kaniko-jail/kaniko
 
-# Set environment variables for Kaniko
-ENV PATH="/kaniko:${PATH}"
-ENV SSL_CERT_DIR="/kaniko/ssl/certs"
+# Kaniko needs SSL certs inside its jail to push to Docker Hub/GitHub
+RUN cp -r /etc/ssl /kaniko-jail/etc/ssl
 
-# 3. Install Python dependencies globally (no venv)
+# 3. Install Python dependencies
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

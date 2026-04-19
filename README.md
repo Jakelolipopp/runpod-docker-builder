@@ -1,10 +1,9 @@
 # RunPod Docker Auto-Builder Worker
 
-An on-demand, serverless Docker image builder for RunPod. This worker clones a GitHub repository, builds a Docker image using `buildah`, and pushes it to DockerHub—all without requiring a Docker daemon (daemonless/DinD).
+An on-demand, serverless Docker image builder for RunPod. This worker clones a GitHub repository, builds a Docker image using `buildah`, and pushes it to DockerHub.
 
 ## Features
 
-- **Daemonless Building**: Uses `buildah` with `vfs` storage driver, enabling builds inside isolated containers.
 - **Automated Authentication**: Securely handles GitHub and DockerHub credentials via RunPod Secrets.
 - **Flexible Contexts**: Supports custom branches, Dockerfile paths, and build context subdirectories.
 - **Isolated Workspace**: Each job runs in a unique temporary directory to prevent state leakage.
@@ -64,18 +63,3 @@ Send a POST request to your RunPod endpoint with the following JSON structure:
   }
 }
 ```
-
-## How it Works
-
-1. **Authentication**: The worker parses the `github_pat_auth` and `dockerhub_pat_auth` env vars to find the token matching the repository owner.
-2. **Cloning**: Uses `GitPython` to perform an authenticated clone into a `tempfile.TemporaryDirectory`.
-3. **Login**: Executes `buildah login` using the resolved DockerHub credentials.
-4. **Build**: Runs `buildah bud --storage-driver vfs` within the specified build context.
-5. **Push**: Pushes the resulting image to DockerHub via `buildah push`.
-6. **Cleanup**: Automatically deletes the temporary directory after the job completes (or fails).
-
-## Troubleshooting
-
-- **Build Failures**: Check the `stderr` in the worker response or RunPod logs.
-- **Credential Issues**: Ensure the environment variables are correctly mapped from Secrets in the RunPod UI.
-- **Context Errors**: Verify that `build_ctx_path` and `dockerfile_path` correctly resolve within your repository structure.

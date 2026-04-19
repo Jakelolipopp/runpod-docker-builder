@@ -4,12 +4,11 @@ FROM python:3.11-slim
 # 1. Install prerequisites
 RUN apt-get update && apt-get install -y git ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# 2. Copy Kaniko binaries
-COPY --from=kaniko /kaniko /kaniko
-ENV PATH="$PATH:/kaniko"
+# 2. Copy Kaniko binaries to a UNIQUE path to prevent ETXTBSY collisions
+COPY --from=kaniko /kaniko /kaniko-engine
+ENV PATH="$PATH:/kaniko-engine"
 
 # 3. Create the hyper-isolated worker bubble
-# We avoid common names like /app or /usr where Dockerfiles usually write
 RUN mkdir -p /__runpod_shield__/code
 WORKDIR /__runpod_shield__/code
 
@@ -18,7 +17,6 @@ RUN python3 -m venv /__runpod_shield__/venv
 ENV PATH="/__runpod_shield__/venv/bin:$PATH"
 
 # 5. Shield the SSL Certificates
-# We copy them into our shield so Kaniko can't break HTTPS when it wipes /etc/ssl
 RUN cp /etc/ssl/certs/ca-certificates.crt /__runpod_shield__/cacert.pem
 ENV REQUESTS_CA_BUNDLE="/__runpod_shield__/cacert.pem"
 ENV SSL_CERT_FILE="/__runpod_shield__/cacert.pem"

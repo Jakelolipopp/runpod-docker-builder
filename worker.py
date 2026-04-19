@@ -9,7 +9,6 @@ from git import Repo
 
 # --- Hardware Detection Helpers ---
 def get_container_memory_gb():
-    """Reads container memory limits directly from Linux cgroups."""
     try:
         with open('/sys/fs/cgroup/memory.max', 'r') as f:
             val = f.read().strip()
@@ -81,7 +80,6 @@ def handler(job):
     # ---------------------------------------------------------
     # WORKSPACE PREPARATION (Inside the Shield)
     # ---------------------------------------------------------
-    # We must clone into our isolated directory so Kaniko doesn't overwrite it
     shield_workspace = "/__runpod_shield__/workspace"
     os.makedirs(shield_workspace, exist_ok=True)
     
@@ -99,12 +97,13 @@ def handler(job):
         absolute_dockerfile_path = os.path.abspath(os.path.join(repo_dir, dockerfile_path))
 
         # ---------------------------------------------------------
-        # ENVIRONMENT ROUTING: Local Testing vs RunPod Production
+        # ENVIRONMENT ROUTING
         # ---------------------------------------------------------
-        if os.path.exists("/kaniko/executor"):
+        
+        # Check for the updated kaniko-engine path
+        if os.path.exists("/kaniko-engine/executor"):
             print("Production environment detected. Using Shielded Kaniko...")
             
-            # Place docker config safely inside the shield
             docker_config_dir = os.path.join(tmp_dir, ".docker")
             os.makedirs(docker_config_dir, exist_ok=True)
             
@@ -119,13 +118,14 @@ def handler(job):
             actual_ram_gb = get_container_memory_gb()
             
             kaniko_cmd = [
-                "/kaniko/executor",
+                "/kaniko-engine/executor",
                 "--context", absolute_ctx_path,
                 "--dockerfile", absolute_dockerfile_path,
                 "--destination", full_image_tag,
                 "--use-new-run",              
                 "--compressed-caching=false", 
-                "--ignore-path=/__runpod_shield__", # CRITICAL: Do not push our worker to DockerHub
+                "--ignore-path=/__runpod_shield__", 
+                "--ignore-path=/kaniko-engine", # Protect the engine from snapshotting
                 "--build-arg", f"MAKEFLAGS=-j{cpu_count}",
                 "--build-arg", f"NPROC={cpu_count}",
                 "--build-arg", f"MAX_JOBS={cpu_count}"

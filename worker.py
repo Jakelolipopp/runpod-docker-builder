@@ -7,8 +7,9 @@ import shutil
 import runpod
 from git import Repo
 
-# --- Hardware Detection Helpers ---
+# --- Hardware Detection & Profiling ---
 def get_container_memory_gb():
+    """Reads container memory limits directly from Linux cgroups."""
     try:
         with open('/sys/fs/cgroup/memory.max', 'r') as f:
             val = f.read().strip()
@@ -29,6 +30,28 @@ def get_container_memory_gb():
         return (pages * page_size) / (1024 ** 3)
     except Exception:
         return 4.0 
+
+def calculate_hardware_profile(cpu_count, ram_gb):
+    """
+    Intelligently maps the vCPU/RAM combination to a safe build profile.
+    Most heavy compilers (C++, Rust) require ~1.5GB to 2GB of RAM per thread.
+    """
+    # 1. Determine Memory Strategy
+    use_redo = ram_gb >= 15.0
+    
+    # 2. Calculate Safe Parallelism
+    # If a worker has 32 CPUs but only 64GB RAM, running 32 concurrent GCC 
+    # compilers might OOM. We cap threads safely based on available RAM.
+    safe_ram_per_thread = 1.5 
+    max_ram_threads = max(1, int(ram_gb / safe_ram_per_thread))
+    
+    build_threads = min(cpu_count, max_ram_threads)
+    
+    return {
+        "threads": build_threads,
+        "mode": "redo" if use_redo else "time",
+        "tier": "Performance" if use_redo else "Budget"
+    }
 
 # --- Authentication Helpers ---
 def parse_auth_env(env_name):
@@ -99,10 +122,19 @@ def handler(job):
         # ---------------------------------------------------------
         # ENVIRONMENT ROUTING
         # ---------------------------------------------------------
-        
-        # Check for the updated kaniko-engine path
         if os.path.exists("/kaniko-engine/executor"):
-            print("Production environment detected. Using Shielded Kaniko...")
+            
+            # --- Hardware Profiling Output ---
+            cpu_count = os.cpu_count() or 1
+            actual_ram_gb = get_container_memory_gb()
+            profile = calculate_hardware_profile(cpu_count, actual_ram_gb)
+            
+            print(f"--- Hardware Profile Detected ---")
+            print(f"vCPUs: {cpu_count} | RAM: {actual_ram_gb:.2f} GB")
+            print(f"Assigned Tier: {profile['tier']}")
+            print(f"Snapshot Mode: {profile['mode']}")
+            print(f"Safe Build Threads: {profile['threads']} (Prevents Compiler OOM)")
+            print(f"---------------------------------")
             
             docker_config_dir = os.path.join(tmp_dir, ".docker")
             os.makedirs(docker_config_dir, exist_ok=True)
@@ -114,9 +146,6 @@ def handler(job):
                 with open(os.path.join(docker_config_dir, "config.json"), "w") as f:
                     json.dump(config_data, f)
             
-            cpu_count = os.cpu_count() or 1
-            actual_ram_gb = get_container_memory_gb()
-            
             kaniko_cmd = [
                 "/kaniko-engine/executor",
                 "--context", absolute_ctx_path,
@@ -125,21 +154,19 @@ def handler(job):
                 "--use-new-run",              
                 "--compressed-caching=false", 
                 "--ignore-path=/__runpod_shield__", 
-                "--ignore-path=/kaniko-engine", # Protect the engine from snapshotting
-                "--build-arg", f"MAKEFLAGS=-j{cpu_count}",
-                "--build-arg", f"NPROC={cpu_count}",
-                "--build-arg", f"MAX_JOBS={cpu_count}"
+                "--ignore-path=/kaniko-engine",
+                f"--snapshot-mode={profile['mode']}",
+                "--build-arg", f"MAKEFLAGS=-j{profile['threads']}",
+                "--build-arg", f"NPROC={profile['threads']}",
+                "--build-arg", f"MAX_JOBS={profile['threads']}",
+                "--build-arg", f"RAYON_NUM_THREADS={profile['threads']}"
             ]
-
-            if actual_ram_gb >= 15.0:
-                kaniko_cmd.extend(["--snapshot-mode=redo"])
-            else:
-                kaniko_cmd.extend(["--snapshot-mode=time"])
             
             env = os.environ.copy()
             env["DOCKER_CONFIG"] = docker_config_dir
-            env["GOMAXPROCS"] = str(cpu_count)
+            env["GOMAXPROCS"] = str(profile['threads']) # Align Go routines with safe threads
 
+            print(f"Building {full_image_tag} via Shielded Kaniko...")
             build_proc = subprocess.run(kaniko_cmd, env=env, capture_output=True, text=True)
             
             if build_proc.returncode != 0:

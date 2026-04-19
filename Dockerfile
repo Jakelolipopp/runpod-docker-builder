@@ -1,28 +1,22 @@
-# Stage 1: Grab Kaniko binaries and SSL certificates
-FROM gcr.io/kaniko-project/executor:latest AS kaniko
+FROM quay.io/buildah/stable
 
-# Stage 2: Your RunPod Worker
-FROM python:3.11-slim
+# Install Python 3 and Git
+RUN dnf -y update && \
+    dnf -y install python3 python3-pip git && \
+    dnf clean all
 
-# Install git for cloning, and ca-certificates for secure DockerHub pushes
-RUN apt-get update && apt-get install -y \
-    git \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Ensure Buildah uses VFS globally to prevent overlayfs namespace errors
+ENV STORAGE_DRIVER=vfs
+ENV BUILDAH_ISOLATION=chroot
 
-# Copy the Kaniko executor binary and its required assets
-COPY --from=kaniko /kaniko /kaniko
-ENV PATH="$PATH:/kaniko"
-
-# Set the working directory
 WORKDIR /app
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
 # Copy the worker script
 COPY worker.py .
 
-# Run the worker with unbuffered logs so they stream in real-time to the RunPod UI
-CMD ["python", "-u", "worker.py"]
+# Run the worker unbuffered
+CMD ["python3", "-u", "worker.py"]

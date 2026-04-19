@@ -1,41 +1,10 @@
 import os
 import subprocess
 import tempfile
-import base64
-import json
-import shutil
 import runpod
 from git import Repo
 
-# --- Hardware Detection Helpers ---
-
-def get_container_memory_gb():
-    """Reads container memory limits directly from Linux cgroups."""
-    try:
-        with open('/sys/fs/cgroup/memory.max', 'r') as f:
-            val = f.read().strip()
-            if val != 'max':
-                return int(val) / (1024 ** 3)
-    except Exception:
-        pass
-
-    try:
-        with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
-            val = f.read().strip()
-            if int(val) < 9000000000000000000:
-                return int(val) / (1024 ** 3)
-    except Exception:
-        pass
-
-    try:
-        pages = os.sysconf('SC_PHYS_PAGES')
-        page_size = os.sysconf('SC_PAGE_SIZE')
-        return (pages * page_size) / (1024 ** 3)
-    except Exception:
-        return 4.0 
-
 # --- Authentication Helpers ---
-
 def parse_auth_env(env_name):
     """Parses multiline 'user:token' secrets mapped from RunPod environment variables."""
     val = os.environ.get(env_name, "")
@@ -51,7 +20,6 @@ def parse_auth_env(env_name):
     return auth_map
 
 # --- The Main Handler ---
-
 def handler(job):
     job_input = job['input']
     
@@ -104,85 +72,62 @@ def handler(job):
         absolute_dockerfile_path = os.path.abspath(os.path.join(repo_dir, dockerfile_path))
 
         # ---------------------------------------------------------
-        # ENVIRONMENT ROUTING: Local Testing vs RunPod Production
+        # THE BUILDAH EXECUTION ENGINE (Safe for RunPod Serverless)
         # ---------------------------------------------------------
+        print("Starting isolated daemonless build via Buildah...")
+        cpu_count = os.cpu_count() or 1
         
-        if os.path.exists("/kaniko/executor"):
-            # === RUNPOD PRODUCTION FLOW (KANIKO) ===
-            print("Production environment detected. Using Kaniko...")
-            
-            docker_config_dir = os.path.join(tmp_dir, ".docker")
-            os.makedirs(docker_config_dir, exist_ok=True)
-            
-            if dockerhub_token:
-                auth_string = f"{dh_user}:{dockerhub_token}"
-                encoded_auth = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
-                config_data = {"auths": {"https://index.docker.io/v1/": {"auth": encoded_auth}}}
-                with open(os.path.join(docker_config_dir, "config.json"), "w") as f:
-                    json.dump(config_data, f)
-            
-            cpu_count = os.cpu_count() or 1
-            actual_ram_gb = get_container_memory_gb()
-            
-            kaniko_cmd = [
-                "/kaniko/executor",
-                "--context", absolute_ctx_path,
-                "--dockerfile", absolute_dockerfile_path,
-                "--destination", full_image_tag,
-                "--use-new-run",              
-                "--compressed-caching=false", 
-                "--build-arg", f"MAKEFLAGS=-j{cpu_count}",
-                "--build-arg", f"NPROC={cpu_count}",
-                "--build-arg", f"MAX_JOBS={cpu_count}",
-                "--build-arg", f"RAYON_NUM_THREADS={cpu_count}"
+        # Step B: Secure DockerHub Login
+        if dockerhub_token:
+            print(f"Authenticating with DockerHub as {dh_user}...")
+            login_cmd = [
+                "buildah", "login", 
+                "--storage-driver", "vfs",
+                "-u", dh_user, 
+                "--password-stdin", "docker.io"
             ]
+            login_proc = subprocess.run(login_cmd, input=dockerhub_token, capture_output=True, text=True)
+            if login_proc.returncode != 0:
+                return {"success": False, "error": "Buildah login failed", "stderr": login_proc.stderr}
 
-            if actual_ram_gb >= 15.0:
-                kaniko_cmd.extend(["--snapshot-mode=redo"])
-            else:
-                kaniko_cmd.extend(["--snapshot-mode=time"])
-            
-            env = os.environ.copy()
-            env["DOCKER_CONFIG"] = docker_config_dir
-            env["GOMAXPROCS"] = str(cpu_count)
+        # Step C: Build the Image
+        print(f"Building {full_image_tag} using {cpu_count} vCPUs...")
+        build_cmd = [
+            "buildah", "bud", 
+            "--storage-driver", "vfs", 
+            "--isolation", "chroot",
+            "--jobs", str(cpu_count),
+            "--build-arg", f"MAKEFLAGS=-j{cpu_count}",
+            "--build-arg", f"NPROC={cpu_count}",
+            "--build-arg", f"MAX_JOBS={cpu_count}",
+            "-t", full_image_tag, 
+            "-f", absolute_dockerfile_path, 
+            absolute_ctx_path
+        ]
+        
+        build_proc = subprocess.run(build_cmd, capture_output=True, text=True)
+        if build_proc.returncode != 0:
+            return {"success": False, "error": "Buildah build failed", "stdout": build_proc.stdout, "stderr": build_proc.stderr}
 
-            build_proc = subprocess.run(kaniko_cmd, env=env, capture_output=True, text=True)
-            
-            if build_proc.returncode != 0:
-                return {"success": False, "error": "Kaniko build/push failed", "stdout": build_proc.stdout, "stderr": build_proc.stderr}
-                
-            return {"success": True, "message": f"Successfully built and pushed {full_image_tag} via Kaniko", "build_log": build_proc.stdout}
+        # Step D: Push the Image
+        print(f"Pushing {full_image_tag} to DockerHub (zstd compressed)...")
+        push_cmd = [
+            "buildah", "push", 
+            "--storage-driver", "vfs",
+            "--compression-format", "zstd", 
+            full_image_tag, 
+            f"docker://docker.io/{full_image_tag}"
+        ]
+        
+        push_proc = subprocess.run(push_cmd, capture_output=True, text=True)
+        if push_proc.returncode != 0:
+            return {"success": False, "error": "Buildah push failed", "stdout": push_proc.stdout, "stderr": push_proc.stderr}
 
-        else:
-            # === LOCAL TESTING FLOW (STANDARD DOCKER) ===
-            print("Local environment detected. Falling back to host Docker daemon...")
-            
-            if not shutil.which("docker"):
-                return {"success": False, "error": "Neither Kaniko nor Docker was found. Cannot build image."}
-
-            # Local Login
-            if dockerhub_token:
-                print("Logging into DockerHub locally...")
-                login_cmd = ["docker", "login", "-u", dh_user, "--password-stdin"]
-                login_proc = subprocess.run(login_cmd, input=dockerhub_token, capture_output=True, text=True)
-                if login_proc.returncode != 0:
-                    return {"success": False, "error": "Local Docker login failed", "stderr": login_proc.stderr}
-
-            # Local Build
-            print(f"Building {full_image_tag} locally...")
-            build_cmd = ["docker", "build", "-t", full_image_tag, "-f", absolute_dockerfile_path, absolute_ctx_path]
-            build_proc = subprocess.run(build_cmd, capture_output=True, text=True)
-            if build_proc.returncode != 0:
-                return {"success": False, "error": "Local Docker build failed", "stderr": build_proc.stderr}
-
-            # Local Push
-            print(f"Pushing {full_image_tag} locally...")
-            push_cmd = ["docker", "push", full_image_tag]
-            push_proc = subprocess.run(push_cmd, capture_output=True, text=True)
-            if push_proc.returncode != 0:
-                return {"success": False, "error": "Local Docker push failed", "stderr": push_proc.stderr}
-
-            return {"success": True, "message": f"Successfully built and pushed {full_image_tag} via Local Docker", "build_log": build_proc.stdout}
+        return {
+            "success": True, 
+            "message": f"Successfully built and pushed {full_image_tag}", 
+            "build_log": build_proc.stdout
+        }
 
 if __name__ == "__main__":
     print("RunPod Auto-Builder Worker Started.")

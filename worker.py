@@ -7,7 +7,7 @@ import shutil
 import runpod
 from git import Repo
 
-# --- Hardware Detection Helpers ---
+# --- Hardware Detection & Profiling ---
 def get_container_memory_gb():
     try:
         with open('/sys/fs/cgroup/memory.max', 'r') as f:
@@ -29,6 +29,18 @@ def get_container_memory_gb():
         return (pages * page_size) / (1024 ** 3)
     except Exception:
         return 4.0 
+
+def calculate_hardware_profile(cpu_count, ram_gb):
+    use_redo = ram_gb >= 15.0
+    safe_ram_per_thread = 1.5 
+    max_ram_threads = max(1, int(ram_gb / safe_ram_per_thread))
+    build_threads = min(cpu_count, max_ram_threads)
+    
+    return {
+        "threads": build_threads,
+        "mode": "redo" if use_redo else "time",
+        "tier": "Performance" if use_redo else "Budget"
+    }
 
 # --- Authentication Helpers ---
 def parse_auth_env(env_name):
@@ -78,7 +90,7 @@ def handler(job):
     full_image_tag = f"{dockerhub_repo}:{dockerhub_tag}"
     
     # ---------------------------------------------------------
-    # WORKSPACE PREPARATION (Inside the Shield)
+    # WORKSPACE PREPARATION
     # ---------------------------------------------------------
     shield_workspace = "/__runpod_shield__/workspace"
     os.makedirs(shield_workspace, exist_ok=True)
@@ -97,12 +109,30 @@ def handler(job):
         absolute_dockerfile_path = os.path.abspath(os.path.join(repo_dir, dockerfile_path))
 
         # ---------------------------------------------------------
-        # ENVIRONMENT ROUTING
+        # ENVIRONMENT ROUTING: Dynamic Engine Locator
         # ---------------------------------------------------------
-        
-        # Check for the updated kaniko-engine path
-        if os.path.exists("/kaniko-engine/executor"):
+        # Dynamically hunt down the Kaniko binary. 
+        kaniko_binary = shutil.which("executor")
+        if not kaniko_binary:
+            if os.path.exists("/kaniko-engine/executor"):
+                kaniko_binary = "/kaniko-engine/executor"
+            elif os.path.exists("/kaniko/executor"):
+                kaniko_binary = "/kaniko/executor"
+
+        if kaniko_binary:
             print("Production environment detected. Using Shielded Kaniko...")
+            
+            # --- Hardware Profiling Output ---
+            cpu_count = os.cpu_count() or 1
+            actual_ram_gb = get_container_memory_gb()
+            profile = calculate_hardware_profile(cpu_count, actual_ram_gb)
+            
+            print(f"--- Hardware Profile Detected ---")
+            print(f"vCPUs: {cpu_count} | RAM: {actual_ram_gb:.2f} GB")
+            print(f"Assigned Tier: {profile['tier']}")
+            print(f"Snapshot Mode: {profile['mode']}")
+            print(f"Safe Build Threads: {profile['threads']} (Prevents Compiler OOM)")
+            print(f"---------------------------------")
             
             docker_config_dir = os.path.join(tmp_dir, ".docker")
             os.makedirs(docker_config_dir, exist_ok=True)
@@ -114,32 +144,30 @@ def handler(job):
                 with open(os.path.join(docker_config_dir, "config.json"), "w") as f:
                     json.dump(config_data, f)
             
-            cpu_count = os.cpu_count() or 1
-            actual_ram_gb = get_container_memory_gb()
+            # Dynamically ignore the directory Kaniko lives in to prevent the ETXTBSY error
+            kaniko_engine_dir = os.path.dirname(kaniko_binary)
             
             kaniko_cmd = [
-                "/kaniko-engine/executor",
+                kaniko_binary,
                 "--context", absolute_ctx_path,
                 "--dockerfile", absolute_dockerfile_path,
                 "--destination", full_image_tag,
                 "--use-new-run",              
                 "--compressed-caching=false", 
                 "--ignore-path=/__runpod_shield__", 
-                "--ignore-path=/kaniko-engine", # Protect the engine from snapshotting
-                "--build-arg", f"MAKEFLAGS=-j{cpu_count}",
-                "--build-arg", f"NPROC={cpu_count}",
-                "--build-arg", f"MAX_JOBS={cpu_count}"
+                f"--ignore-path={kaniko_engine_dir}",
+                f"--snapshot-mode={profile['mode']}",
+                "--build-arg", f"MAKEFLAGS=-j{profile['threads']}",
+                "--build-arg", f"NPROC={profile['threads']}",
+                "--build-arg", f"MAX_JOBS={profile['threads']}",
+                "--build-arg", f"RAYON_NUM_THREADS={profile['threads']}"
             ]
-
-            if actual_ram_gb >= 15.0:
-                kaniko_cmd.extend(["--snapshot-mode=redo"])
-            else:
-                kaniko_cmd.extend(["--snapshot-mode=time"])
             
             env = os.environ.copy()
             env["DOCKER_CONFIG"] = docker_config_dir
-            env["GOMAXPROCS"] = str(cpu_count)
+            env["GOMAXPROCS"] = str(profile['threads']) 
 
+            print(f"Building {full_image_tag}...")
             build_proc = subprocess.run(kaniko_cmd, env=env, capture_output=True, text=True)
             
             if build_proc.returncode != 0:

@@ -7,29 +7,6 @@ import shutil
 import runpod
 from git import Repo
 
-# --- Hardware Detection Helpers ---
-def get_container_memory_gb():
-    try:
-        with open('/sys/fs/cgroup/memory.max', 'r') as f:
-            val = f.read().strip()
-            if val != 'max':
-                return int(val) / (1024 ** 3)
-    except Exception:
-        pass
-    try:
-        with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
-            val = f.read().strip()
-            if int(val) < 9000000000000000000:
-                return int(val) / (1024 ** 3)
-    except Exception:
-        pass
-    try:
-        pages = os.sysconf('SC_PHYS_PAGES')
-        page_size = os.sysconf('SC_PAGE_SIZE')
-        return (pages * page_size) / (1024 ** 3)
-    except Exception:
-        return 4.0 
-
 # --- Authentication Helpers ---
 def parse_auth_env(env_name):
     val = os.environ.get(env_name, "")
@@ -89,7 +66,8 @@ def handler(job):
             
         print(f"Cloning {github_repo} (branch: {branch})...")
         try:
-            Repo.clone_from(clone_url, repo_dir, branch=branch)
+            # OPTIMIZATION: Shallow clone (depth=1) speeds up download significantly
+            Repo.clone_from(clone_url, repo_dir, branch=branch, depth=1)
         except Exception as e:
             return {"error": f"Failed to clone repository: {str(e)}"}
         
@@ -114,8 +92,8 @@ def handler(job):
                 with open(os.path.join(docker_config_dir, "config.json"), "w") as f:
                     json.dump(config_data, f)
             
-            cpu_count = os.cpu_count() or 1
-            actual_ram_gb = get_container_memory_gb()
+            # OPTIMIZATION: Hardcoded for known hardware environment
+            cpu_count = 16
             
             kaniko_cmd = [
                 "/kaniko-engine/executor",
@@ -125,20 +103,21 @@ def handler(job):
                 "--use-new-run",              
                 "--compressed-caching=false", 
                 "--ignore-path=/__runpod_shield__", 
-                "--ignore-path=/kaniko-engine", # Protect the engine from snapshotting
+                "--ignore-path=/kaniko-engine", 
                 "--build-arg", f"MAKEFLAGS=-j{cpu_count}",
                 "--build-arg", f"NPROC={cpu_count}",
-                "--build-arg", f"MAX_JOBS={cpu_count}"
+                "--build-arg", f"MAX_JOBS={cpu_count}",
+                "--snapshot-mode=redo" # OPTIMIZATION: Explicitly use high-RAM redo mode
             ]
-
-            if actual_ram_gb >= 15.0:
-                kaniko_cmd.extend(["--snapshot-mode=redo"])
-            else:
-                kaniko_cmd.extend(["--snapshot-mode=time"])
             
             env = os.environ.copy()
             env["DOCKER_CONFIG"] = docker_config_dir
+            # OPTIMIZATION: Maximum concurrency for Go execution
             env["GOMAXPROCS"] = str(cpu_count)
+            # OPTIMIZATION: Delay Garbage Collection to utilize the 32GB RAM for faster builds
+            env["GOGC"] = "1000"
+            # OPTIMIZATION: Soft memory limit to prevent Go from utilizing 100% of RAM and crashing
+            env["GOMEMLIMIT"] = "28000MiB"
 
             build_proc = subprocess.run(kaniko_cmd, env=env, capture_output=True, text=True)
             

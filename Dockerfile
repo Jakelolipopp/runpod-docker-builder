@@ -9,24 +9,21 @@ COPY --from=kaniko /kaniko /kaniko-engine
 ENV PATH="$PATH:/kaniko-engine"
 
 # 3. Create the hyper-isolated worker bubble
-RUN mkdir -p /__runpod_shield__/code
-WORKDIR /__runpod_shield__/code
+RUN mkdir -p /__runpod_shield__
+WORKDIR /__runpod_shield__
 
-# 4. Create an isolated Virtual Environment
-RUN python3 -m venv /__runpod_shield__/venv
-ENV PATH="/__runpod_shield__/venv/bin:$PATH"
-
-# 5. Shield the SSL Certificates
+# 4. Shield the SSL Certificates 
+# (This ensures Kaniko doesn't break RunPod's API pings when it wipes the host OS)
 RUN cp /etc/ssl/certs/ca-certificates.crt /__runpod_shield__/cacert.pem
 ENV REQUESTS_CA_BUNDLE="/__runpod_shield__/cacert.pem"
 ENV SSL_CERT_FILE="/__runpod_shield__/cacert.pem"
 
-# 6. Install worker dependencies into the shield
+# 5. Install worker dependencies globally (Bypassing the venv OCI symlink bug)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 7. Copy worker script
+# 6. Copy worker script
 COPY worker.py .
 
-# Run the shielded worker
-CMD ["/__runpod_shield__/venv/bin/python", "-u", "worker.py"]
+# Run the shielded worker using the global, hard-linked python binary
+CMD ["python3", "-u", "worker.py"]

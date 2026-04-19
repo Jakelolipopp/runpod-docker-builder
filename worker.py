@@ -190,7 +190,6 @@ def handler(job):
             "buildah", "push",
             "--storage-driver", "vfs",
             "--compression-format", "zstd", # Multi-threaded, high-performance compression
-            "--threads", str(cpu_count),    # Use all cores for compression
             full_image_tag,
             f"docker://docker.io/{full_image_tag}"
         ]

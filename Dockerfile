@@ -1,25 +1,22 @@
-FROM gcr.io/kaniko-project/executor:latest AS kaniko
-FROM python:3.11-slim
+# Use the kaniko debug image which includes a shell
+FROM gcr.io/kaniko-project/executor:debug AS kaniko
 
-# 1. System dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Use a python base for the RunPod worker logic
+FROM python:3.10-slim
 
-# 2. Build the Kaniko Jail
-RUN mkdir -p /kaniko-jail/workspace /kaniko-jail/tmp /kaniko-jail/etc
-COPY --from=kaniko /kaniko /kaniko-jail/kaniko
+# Copy kaniko binary and certificates from the kaniko image
+COPY --from=kaniko /kaniko/executor /kaniko/executor
+COPY --from=kaniko /kaniko/ssl/certs/ /kaniko/ssl/certs/
+COPY --from=kaniko /busybox/ /busybox/
 
-# Kaniko needs SSL certs inside its jail to push to Docker Hub/GitHub
-RUN cp -r /etc/ssl /kaniko-jail/etc/ssl
+# Set PATH to include busybox for basic shell commands (mkdir, cp, etc)
+ENV PATH="/busybox:/kaniko:${PATH}"
+ENV SSL_CERT_DIR=/kaniko/ssl/certs
 
-# 3. Install Python dependencies
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install RunPod SDK
+RUN pip install runpod
 
-# 4. Copy worker
+# Copy your worker script
 COPY worker.py .
 
-CMD ["python3", "-u", "worker.py"]
+CMD [ "python", "-u", "/worker.py" ]

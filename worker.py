@@ -134,7 +134,6 @@ def handler(job):
             login_cmd = [
                 "buildah", "login", 
                 "--storage-driver", "vfs",
-                "--isolation", "chroot",
                 "-u", dh_user, 
                 "--password-stdin", "docker.io"
             ]
@@ -190,7 +189,6 @@ def handler(job):
         push_cmd = [
             "buildah", "push",
             "--storage-driver", "vfs",
-            "--isolation", "chroot",
             "--compression-format", "zstd", # Multi-threaded, high-performance compression
             "--threads", str(cpu_count),    # Use all cores for compression
             full_image_tag,

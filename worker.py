@@ -24,14 +24,10 @@ def handler(job):
     gh_auth = job_input.get('github_access_token') or os.environ.get('github_pat_auth')
     dh_auth = job_input.get('dockerhub_access_token') or os.environ.get('dockerhub_pat_auth')
 
-    # 3. Configure DockerHub Auth (For Pushing)
+    # 3. Configure DockerHub Auth
     if dh_auth:
         try:
-            # Ensure the directory exists
             os.makedirs('/kaniko/.docker', exist_ok=True)
-            
-            # DockerHub requires the raw string "username:password" to be base64 encoded
-            # If your secret is just the token, you MUST provide "username:token"
             auth_bytes = dh_auth.encode('utf-8')
             auth_base64 = base64.b64encode(auth_bytes).decode('utf-8')
             
@@ -45,11 +41,8 @@ def handler(job):
             
             with open('/kaniko/.docker/config.json', 'w') as f:
                 json.dump(config, f)
-            print("Successfully configured /kaniko/.docker/config.json")
         except Exception as e:
             print(f"Auth Configuration Error: {e}")
-    else:
-        print("Warning: No DockerHub credentials found in 'dockerhub_pat_auth' environment variable.")
 
     # 4. Construct Git Context
     if gh_auth:
@@ -62,13 +55,18 @@ def handler(job):
         print(f"Context: {context_url}")
 
     # 5. Build Kaniko Arguments
+    # We add --ignore-path for the executor and python libs to prevent "text file busy" 
+    # and SSL certificate deletion errors.
     cmd = [
         "/kaniko/executor",
         "--context", context_url,
         "--dockerfile", dockerfile_path,
         "--destination", f"{dockerhub_repo}:{dockerhub_tag}",
         "--force",
-        "--skip-push-permission-check" # Prevents premature auth failure before build starts
+        "--skip-push-permission-check",
+        "--ignore-path", "/kaniko/executor",
+        "--ignore-path", "/usr/local/lib/python3.10",
+        "--ignore-path", "/etc/ssl/certs"
     ]
 
     if build_ctx_path and build_ctx_path.strip():
@@ -99,7 +97,7 @@ def handler(job):
                 "image": f"{dockerhub_repo}:{dockerhub_tag}"
             }
         else:
-            error_snippet = "".join(logs[-15:]) if logs else "No logs captured."
+            error_snippet = "".join(logs[-20:]) if logs else "No logs captured."
             return {
                 "status": "error", 
                 "message": f"Kaniko Exit Code {process.returncode}",

@@ -4,6 +4,8 @@ import tempfile
 import base64
 import json
 import shutil
+import time
+import threading
 import runpod
 from git import Repo
 
@@ -90,9 +92,8 @@ def handler(job):
     full_image_tag = f"{dockerhub_repo}:{dockerhub_tag}"
     
     # ---------------------------------------------------------
-    # WORKSPACE PREPARATION (Moved entirely to /tmp)
+    # WORKSPACE PREPARATION 
     # ---------------------------------------------------------
-    # We build entirely out of /tmp so Kaniko can cleanly ignore it
     builder_workspace = "/tmp/builder_workspace"
     os.makedirs(builder_workspace, exist_ok=True)
     
@@ -123,7 +124,6 @@ def handler(job):
             print("Production environment detected. Preparing Kaniko Ghost Engine...")
             
             # --- THE GHOST ENGINE FIX ---
-            # Run Kaniko from a temporary copy so the kernel doesn't lock the destination path
             kaniko_original_dir = os.path.dirname(kaniko_original_binary)
             kaniko_ghost_dir = "/tmp/kaniko-ghost"
             
@@ -132,6 +132,16 @@ def handler(job):
                 
             kaniko_ghost_binary = os.path.join(kaniko_ghost_dir, "executor")
             os.chmod(kaniko_ghost_binary, 0o755)
+
+            # --- THE LIFELINE (Prevents RunPod heartbeat crash) ---
+            cert_lifeline = "/tmp/cacert.pem"
+            if os.path.exists("/__runpod_shield__/cacert.pem"):
+                shutil.copy("/__runpod_shield__/cacert.pem", cert_lifeline)
+            elif os.path.exists("/etc/ssl/certs/ca-certificates.crt"):
+                shutil.copy("/etc/ssl/certs/ca-certificates.crt", cert_lifeline)
+                
+            os.environ["REQUESTS_CA_BUNDLE"] = cert_lifeline
+            os.environ["SSL_CERT_FILE"] = cert_lifeline
 
             # --- HARDWARE PROFILING ---
             cpu_count = os.cpu_count() or 1
@@ -162,7 +172,7 @@ def handler(job):
                 "--destination", full_image_tag,
                 "--use-new-run",              
                 "--compressed-caching=false", 
-                "--ignore-path=/tmp", # Completely ignores the workspace repo AND the Ghost Engine
+                "--ignore-path=/tmp", # Protects our Workspace, Ghost Engine, and Lifeline Cert
                 f"--snapshot-mode={profile['mode']}",
                 "--build-arg", f"MAKEFLAGS=-j{profile['threads']}",
                 "--build-arg", f"NPROC={profile['threads']}",
@@ -179,6 +189,17 @@ def handler(job):
             
             if build_proc.returncode != 0:
                 return {"success": False, "error": "Kaniko build/push failed", "stdout": build_proc.stdout, "stderr": build_proc.stderr}
+            
+            # --- KAMIKAZE PROTOCOL ---
+            # Spin up a background thread to kill the container after returning success.
+            # This ensures RunPod provisions a fresh container for the next job,
+            # wiping away the filesystem damage Kaniko caused.
+            def kamikaze():
+                time.sleep(5)
+                print("Kamikaze triggered: Killing corrupted worker to force a clean pod for the next job.")
+                os._exit(0)
+                
+            threading.Thread(target=kamikaze, daemon=True).start()
                 
             return {"success": True, "message": f"Successfully built and pushed {full_image_tag} via Kaniko", "build_log": build_proc.stdout}
 

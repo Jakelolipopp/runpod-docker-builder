@@ -7,8 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Copy Kaniko executor to a dedicated path
-COPY --from=kaniko /kaniko/executor /usr/local/bin/kaniko-executor
+# 2. Copy the ENTIRE Kaniko directory (fixes the lstat error and brings SSL certs)
+COPY --from=kaniko /kaniko /kaniko
+
+# Set environment variables for Kaniko
+ENV PATH="/kaniko:${PATH}"
+ENV SSL_CERT_DIR="/kaniko/ssl/certs"
 
 # 3. Install Python dependencies globally (no venv)
 WORKDIR /app

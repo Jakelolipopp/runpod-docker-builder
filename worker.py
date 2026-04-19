@@ -12,8 +12,8 @@ from git import Repo
 # ---------------------------------------------------------------------------
 # CONSTANTS
 # ---------------------------------------------------------------------------
-KANIKO_EXECUTOR = "/usr/local/bin/kaniko-executor"
-KANIKO_GHOST    = "/tmp/kaniko-ghost-executor"  # Run from here to free the destination path
+KANIKO_EXECUTOR = "/kaniko/executor"             # Updated path
+KANIKO_GHOST    = "/tmp/kaniko-ghost-executor"   # Run from here to free the destination path
 
 # ---------------------------------------------------------------------------
 # HARDWARE PROFILING

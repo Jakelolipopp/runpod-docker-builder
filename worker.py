@@ -1,110 +1,178 @@
-import runpod
-import subprocess
 import os
-import json
-import urllib.parse
+import subprocess
+import tempfile
 import base64
+import json
+import shutil
+import runpod
+from git import Repo
 
+# --- Hardware Detection Helpers ---
+def get_container_memory_gb():
+    try:
+        with open('/sys/fs/cgroup/memory.max', 'r') as f:
+            val = f.read().strip()
+            if val != 'max':
+                return int(val) / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
+            val = f.read().strip()
+            if int(val) < 9000000000000000000:
+                return int(val) / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        pages = os.sysconf('SC_PHYS_PAGES')
+        page_size = os.sysconf('SC_PAGE_SIZE')
+        return (pages * page_size) / (1024 ** 3)
+    except Exception:
+        return 4.0 
+
+# --- Authentication Helpers ---
+def parse_auth_env(env_name):
+    val = os.environ.get(env_name, "")
+    auth_map = {}
+    if not val:
+        return auth_map
+    for line in val.strip().split('\n'):
+        if ':' in line:
+            parts = line.split(':', 1)
+            if len(parts) == 2:
+                user, token = parts
+                auth_map[user.strip()] = token.strip()
+    return auth_map
+
+# --- The Main Handler ---
 def handler(job):
-    job_input = job.get('input', {})
+    job_input = job['input']
     
-    # 1. Inputs
     github_repo = job_input.get('github_repo')
-    dockerhub_repo = job_input.get('dockerhub_repo')
-    
-    if not github_repo or not dockerhub_repo:
-        return {"status": "error", "message": "Missing github_repo or dockerhub_repo"}
+    if not github_repo:
+        return {"error": "Missing 'github_repo' in input."}
     
     branch = job_input.get('branch', 'main')
     dockerfile_path = job_input.get('dockerfile_path', 'Dockerfile')
-    build_ctx_path = job_input.get('build_ctx_path', '')
-    dockerhub_tag = job_input.get('dockerhub_tag', 'latest')
+    build_ctx_path = job_input.get('build_ctx_path', '.')
+    github_token = job_input.get('github_access_token')
     
-    # 2. Authentication Secrets
-    gh_auth = job_input.get('github_access_token') or os.environ.get('github_pat_auth')
-    dh_auth = job_input.get('dockerhub_access_token') or os.environ.get('dockerhub_pat_auth')
-
-    # 3. Configure DockerHub Auth
-    if dh_auth:
-        try:
-            os.makedirs('/kaniko/.docker', exist_ok=True)
-            auth_bytes = dh_auth.encode('utf-8')
-            auth_base64 = base64.b64encode(auth_bytes).decode('utf-8')
-            
-            config = {
-                "auths": {
-                    "https://index.docker.io/v1/": {
-                        "auth": auth_base64
-                    }
-                }
-            }
-            
-            with open('/kaniko/.docker/config.json', 'w') as f:
-                json.dump(config, f)
-        except Exception as e:
-            print(f"Auth Configuration Error: {e}")
-
-    # 4. Construct Git Context
-    if gh_auth:
-        token_only = gh_auth.split(':')[-1]
-        safe_token = urllib.parse.quote(token_only)
-        context_url = f"git://{safe_token}@github.com/{github_repo}#refs/heads/{branch}"
-        print(f"Context: git://[REDACTED]@github.com/{github_repo}")
-    else:
-        context_url = f"git://github.com/{github_repo}#refs/heads/{branch}"
-        print(f"Context: {context_url}")
-
-    # 5. Build Kaniko Arguments
-    # We add --ignore-path for the executor and python libs to prevent "text file busy" 
-    # and SSL certificate deletion errors.
-    cmd = [
-        "/kaniko/executor",
-        "--context", context_url,
-        "--dockerfile", dockerfile_path,
-        "--destination", f"{dockerhub_repo}:{dockerhub_tag}",
-        "--force",
-        "--skip-push-permission-check",
-        "--ignore-path", "/kaniko/executor",
-        "--ignore-path", "/usr/local/lib/python3.10",
-        "--ignore-path", "/etc/ssl/certs"
-    ]
-
-    if build_ctx_path and build_ctx_path.strip():
-        cmd.extend(["--context-sub-path", build_ctx_path])
-
-    print(f"Running Kaniko with args: {cmd}")
-
-    # 6. Execution
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-
-        logs = []
-        for line in process.stdout:
-            print(line, end='')
-            logs.append(line)
+    dockerhub_repo = job_input.get('dockerhub_repo')
+    if not dockerhub_repo:
+        return {"error": "Missing 'dockerhub_repo' in input."}
+    
+    dockerhub_tag = job_input.get('dockerhub_tag', 'latest')
+    dockerhub_token = job_input.get('dockerhub_access_token')
+    
+    gh_auth_map = parse_auth_env('github_pat_auth')
+    dh_auth_map = parse_auth_env('dockerhub_pat_auth')
+    
+    if not github_token:
+        repo_owner = github_repo.split('/')[0]
+        github_token = gh_auth_map.get(repo_owner)
         
-        process.wait()
+    dh_user = dockerhub_repo.split('/')[0]
+    if not dockerhub_token:
+        dockerhub_token = dh_auth_map.get(dh_user)
 
-        if process.returncode == 0:
-            return {
-                "status": "success", 
-                "image": f"{dockerhub_repo}:{dockerhub_tag}"
-            }
+    full_image_tag = f"{dockerhub_repo}:{dockerhub_tag}"
+    
+    # ---------------------------------------------------------
+    # WORKSPACE PREPARATION (Inside the Shield)
+    # ---------------------------------------------------------
+    shield_workspace = "/__runpod_shield__/workspace"
+    os.makedirs(shield_workspace, exist_ok=True)
+    
+    with tempfile.TemporaryDirectory(dir=shield_workspace) as tmp_dir:
+        repo_dir = os.path.join(tmp_dir, "repo")
+        clone_url = f"https://{github_token}@github.com/{github_repo}.git" if github_token else f"https://github.com/{github_repo}.git"
+            
+        print(f"Cloning {github_repo} (branch: {branch})...")
+        try:
+            Repo.clone_from(clone_url, repo_dir, branch=branch)
+        except Exception as e:
+            return {"error": f"Failed to clone repository: {str(e)}"}
+        
+        absolute_ctx_path = os.path.abspath(os.path.join(repo_dir, build_ctx_path))
+        absolute_dockerfile_path = os.path.abspath(os.path.join(repo_dir, dockerfile_path))
+
+        # ---------------------------------------------------------
+        # ENVIRONMENT ROUTING
+        # ---------------------------------------------------------
+        
+        # Check for the updated kaniko-engine path
+        if os.path.exists("/kaniko-engine/executor"):
+            print("Production environment detected. Using Shielded Kaniko...")
+            
+            docker_config_dir = os.path.join(tmp_dir, ".docker")
+            os.makedirs(docker_config_dir, exist_ok=True)
+            
+            if dockerhub_token:
+                auth_string = f"{dh_user}:{dockerhub_token}"
+                encoded_auth = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+                config_data = {"auths": {"https://index.docker.io/v1/": {"auth": encoded_auth}}}
+                with open(os.path.join(docker_config_dir, "config.json"), "w") as f:
+                    json.dump(config_data, f)
+            
+            cpu_count = os.cpu_count() or 1
+            actual_ram_gb = get_container_memory_gb()
+            
+            kaniko_cmd = [
+                "/kaniko-engine/executor",
+                "--context", absolute_ctx_path,
+                "--dockerfile", absolute_dockerfile_path,
+                "--destination", full_image_tag,
+                "--use-new-run",              
+                "--compressed-caching=false", 
+                "--ignore-path=/__runpod_shield__", 
+                "--ignore-path=/kaniko-engine", # Protect the engine from snapshotting
+                "--build-arg", f"MAKEFLAGS=-j{cpu_count}",
+                "--build-arg", f"NPROC={cpu_count}",
+                "--build-arg", f"MAX_JOBS={cpu_count}"
+            ]
+
+            if actual_ram_gb >= 15.0:
+                kaniko_cmd.extend(["--snapshot-mode=redo"])
+            else:
+                kaniko_cmd.extend(["--snapshot-mode=time"])
+            
+            env = os.environ.copy()
+            env["DOCKER_CONFIG"] = docker_config_dir
+            env["GOMAXPROCS"] = str(cpu_count)
+
+            build_proc = subprocess.run(kaniko_cmd, env=env, capture_output=True, text=True)
+            
+            if build_proc.returncode != 0:
+                return {"success": False, "error": "Kaniko build/push failed", "stdout": build_proc.stdout, "stderr": build_proc.stderr}
+                
+            return {"success": True, "message": f"Successfully built and pushed {full_image_tag} via Kaniko", "build_log": build_proc.stdout}
+
         else:
-            error_snippet = "".join(logs[-20:]) if logs else "No logs captured."
-            return {
-                "status": "error", 
-                "message": f"Kaniko Exit Code {process.returncode}",
-                "details": error_snippet
-            }
+            print("Local environment detected. Falling back to host Docker daemon...")
+            if not shutil.which("docker"):
+                return {"success": False, "error": "Neither Kaniko nor Docker was found. Cannot build image."}
 
-    except Exception as e:
-        return {"status": "error", "message": f"Internal Error: {str(e)}"}
+            if dockerhub_token:
+                print("Logging into DockerHub locally...")
+                login_cmd = ["docker", "login", "-u", dh_user, "--password-stdin"]
+                login_proc = subprocess.run(login_cmd, input=dockerhub_token, capture_output=True, text=True)
+                if login_proc.returncode != 0:
+                    return {"success": False, "error": "Local Docker login failed", "stderr": login_proc.stderr}
 
-runpod.serverless.start({"handler": handler})
+            print(f"Building {full_image_tag} locally...")
+            build_cmd = ["docker", "build", "-t", full_image_tag, "-f", absolute_dockerfile_path, absolute_ctx_path]
+            build_proc = subprocess.run(build_cmd, capture_output=True, text=True)
+            if build_proc.returncode != 0:
+                return {"success": False, "error": "Local Docker build failed", "stderr": build_proc.stderr}
+
+            print(f"Pushing {full_image_tag} locally...")
+            push_cmd = ["docker", "push", full_image_tag]
+            push_proc = subprocess.run(push_cmd, capture_output=True, text=True)
+            if push_proc.returncode != 0:
+                return {"success": False, "error": "Local Docker push failed", "stderr": push_proc.stderr}
+
+            return {"success": True, "message": f"Successfully built and pushed {full_image_tag} via Local Docker", "build_log": build_proc.stdout}
+
+if __name__ == "__main__":
+    print("RunPod Auto-Builder Worker Started.")
+    runpod.serverless.start({"handler": handler})

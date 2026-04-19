@@ -138,6 +138,10 @@ def handler(job):
         else:
             print("Warning: No DockerHub token provided or found in environment. Push might fail.")
 
+        # 5. Optimization: Detect CPU Count and Configure Parallelism
+        cpu_count = os.cpu_count() or 1
+        print(f"Optimization: Detected {cpu_count} vCPUs. Configuring for parallel build.")
+        
         # C. Build the Image
         # We need to change CWD to the build context inside the repo
         absolute_ctx_path = os.path.abspath(os.path.join(repo_dir, build_ctx_path))
@@ -149,6 +153,11 @@ def handler(job):
             "buildah", "bud",
             "--storage-driver", "vfs",
             "--isolation", "chroot",
+            "--jobs", str(cpu_count), # Parallelize build stages if possible
+            # Inject parallelism flags as build args so tools inside the Dockerfile (make, pip, npm) use all cores
+            "--build-arg", f"MAKEFLAGS=-j{cpu_count}",
+            "--build-arg", f"NPROC={cpu_count}",
+            "--build-arg", f"MAX_JOBS={cpu_count}",
             "-t", full_image_tag,
             "-f", absolute_dockerfile_path,
             "." # We will run this from the absolute_ctx_path
@@ -171,10 +180,12 @@ def handler(job):
             }
         
         # D. Push the Image
-        print(f"Pushing image {full_image_tag} to DockerHub...")
+        print(f"Pushing image {full_image_tag} to DockerHub using zstd compression...")
         push_cmd = [
             "buildah", "push",
             "--storage-driver", "vfs",
+            "--compression-format", "zstd", # Multi-threaded, high-performance compression
+            "--threads", str(cpu_count),    # Use all cores for compression
             full_image_tag,
             f"docker://docker.io/{full_image_tag}"
         ]

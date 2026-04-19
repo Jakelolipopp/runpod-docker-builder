@@ -3,112 +3,96 @@ import subprocess
 import os
 import json
 import urllib.parse
+import base64
 
 def handler(job):
-    """
-    RunPod handler to build and push Docker images using Kaniko.
-    """
     job_input = job.get('input', {})
     
-    # 1. Extract and Validate Input
+    # 1. Inputs
     github_repo = job_input.get('github_repo')
     dockerhub_repo = job_input.get('dockerhub_repo')
     
     if not github_repo or not dockerhub_repo:
-        return {
-            "status": "error", 
-            "message": "Missing required fields: 'github_repo' and 'dockerhub_repo' are mandatory."
-        }
+        return {"status": "error", "message": "Missing github_repo or dockerhub_repo"}
     
-    # Optional parameters with defaults
     branch = job_input.get('branch', 'main')
     dockerfile_path = job_input.get('dockerfile_path', 'Dockerfile')
-    build_ctx_path = job_input.get('build_ctx_path', '.')
+    build_ctx_path = job_input.get('build_ctx_path', '')
     dockerhub_tag = job_input.get('dockerhub_tag', 'latest')
     
-    # 2. Handle Credentials (Prioritize direct input over RunPod Secrets)
-    # github_pat_auth format: "username:token" or just "token"
+    # 2. Authentication Secrets
     gh_auth = job_input.get('github_access_token') or os.environ.get('github_pat_auth')
-    # dockerhub_pat_auth format: "username:token"
     dh_auth = job_input.get('dockerhub_access_token') or os.environ.get('dockerhub_pat_auth')
 
-    # 3. Configure Docker Registry Auth (for Pushing)
-    if dh_auth and ':' in dh_auth:
+    # 3. Configure DockerHub Auth (For Pushing)
+    if dh_auth:
         try:
             os.makedirs('/kaniko/.docker', exist_ok=True)
-            # Create the base64 auth string
-            # We use a shell-less approach for safety
-            import base64
-            encoded_auth = base64.b64encode(dh_auth.encode()).decode()
-            
-            auth_config = {
-                "auths": {
-                    "https://index.docker.io/v1/": {
-                        "auth": encoded_auth
-                    }
-                }
-            }
+            # Support both "user:token" and "token" (for Hub, usually user:token)
+            auth_str = base64.b64encode(dh_auth.encode()).decode()
+            config = {"auths": {"https://index.docker.io/v1/": {"auth": auth_str}}}
             with open('/kaniko/.docker/config.json', 'w') as f:
-                json.dump(auth_config, f)
+                json.dump(config, f)
         except Exception as e:
-            return {"status": "error", "message": f"Failed to configure DockerHub auth: {str(e)}"}
-    else:
-        print("Warning: No valid DockerHub credentials found. Push may fail if repo is private.")
+            print(f"Auth Setup Error: {e}")
 
-    # 4. Construct Authenticated Git URL
-    # We URL-encode the auth string to handle special characters in tokens
+    # 4. Construct Git Context
+    # If using a PAT, the most reliable Kaniko format is: git://<token>@github.com/<repo>
     if gh_auth:
-        encoded_gh = urllib.parse.quote(gh_auth)
-        # Pattern: git://user:token@github.com/owner/repo#refs/heads/branch
-        git_url = f"git://{encoded_gh}@github.com/{github_repo}#refs/heads/{branch}"
+        # If the secret is "username:token", we just need the token part for the URL username field
+        token_only = gh_auth.split(':')[-1]
+        safe_token = urllib.parse.quote(token_only)
+        context_url = f"git://{safe_token}@github.com/{github_repo}#refs/heads/{branch}"
+        print(f"Context: git://[REDACTED]@github.com/{github_repo}#refs/heads/{branch}")
     else:
-        git_url = f"https://github.com/{github_repo}.git#refs/heads/{branch}"
+        context_url = f"https://github.com/{github_repo}.git#refs/heads/{branch}"
 
-    # 5. Execute Kaniko
-    # --force is required to run Kaniko inside another container (RunPod)
-    # --context-sub-path allows building from a sub-folder in the repo
+    # 5. Build Kaniko Arguments
+    # We use list format to avoid shell injection and quoting issues
     cmd = [
         "/kaniko/executor",
-        f"--context={git_url}",
-        f"--dockerfile={dockerfile_path}",
-        f"--destination={dockerhub_repo}:{dockerhub_tag}",
-        f"--context-sub-path={build_ctx_path}",
+        "--context", context_url,
+        "--dockerfile", dockerfile_path,
+        "--destination", f"{dockerhub_repo}:{dockerhub_tag}",
         "--force"
     ]
 
-    print(f"Executing Kaniko: {' '.join(cmd)}")
+    # Add optional sub-path if provided
+    if build_ctx_path:
+        cmd.extend(["--context-sub-path", build_ctx_path])
 
+    print(f"Running Kaniko with args: {cmd}")
+
+    # 6. Execution
     try:
-        # We use Popen to stream logs in real-time to the RunPod console
+        # capture_output=False so it streams to RunPod system logs automatically
         process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.STDOUT, 
-            text=True
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
         )
-        
-        full_output = []
+
+        logs = []
         for line in process.stdout:
-            print(line, end='')  # Stream to RunPod logs
-            full_output.append(line)
+            print(line, end='')
+            logs.append(line)
         
         process.wait()
-        
+
         if process.returncode == 0:
-            return {
-                "status": "success",
-                "image": f"{dockerhub_repo}:{dockerhub_tag}",
-                "job_id": job.get('id')
-            }
+            return {"status": "success", "image": f"{dockerhub_repo}:{dockerhub_tag}"}
         else:
+            # Return the last few lines of the actual error to RunPod
+            error_snippet = "".join(logs[-10:]) if logs else "No logs captured."
             return {
-                "status": "error",
-                "message": "Kaniko build failed. Check logs for details.",
-                "logs": "".join(full_output[-20:]) # Return last 20 lines of error
+                "status": "error", 
+                "message": f"Exit Code {process.returncode}",
+                "details": error_snippet
             }
 
     except Exception as e:
-        return {"status": "error", "message": f"System error: {str(e)}"}
+        return {"status": "error", "message": str(e)}
 
-# Start the RunPod worker
 runpod.serverless.start({"handler": handler})

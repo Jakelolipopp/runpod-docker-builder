@@ -90,12 +90,13 @@ def handler(job):
     full_image_tag = f"{dockerhub_repo}:{dockerhub_tag}"
     
     # ---------------------------------------------------------
-    # WORKSPACE PREPARATION
+    # WORKSPACE PREPARATION (Moved entirely to /tmp)
     # ---------------------------------------------------------
-    shield_workspace = "/__runpod_shield__/workspace"
-    os.makedirs(shield_workspace, exist_ok=True)
+    # We build entirely out of /tmp so Kaniko can cleanly ignore it
+    builder_workspace = "/tmp/builder_workspace"
+    os.makedirs(builder_workspace, exist_ok=True)
     
-    with tempfile.TemporaryDirectory(dir=shield_workspace) as tmp_dir:
+    with tempfile.TemporaryDirectory(dir=builder_workspace) as tmp_dir:
         repo_dir = os.path.join(tmp_dir, "repo")
         clone_url = f"https://{github_token}@github.com/{github_repo}.git" if github_token else f"https://github.com/{github_repo}.git"
             
@@ -109,20 +110,30 @@ def handler(job):
         absolute_dockerfile_path = os.path.abspath(os.path.join(repo_dir, dockerfile_path))
 
         # ---------------------------------------------------------
-        # ENVIRONMENT ROUTING: Dynamic Engine Locator
+        # ENVIRONMENT ROUTING
         # ---------------------------------------------------------
-        # Dynamically hunt down the Kaniko binary. 
-        kaniko_binary = shutil.which("executor")
-        if not kaniko_binary:
+        kaniko_original_binary = shutil.which("executor")
+        if not kaniko_original_binary:
             if os.path.exists("/kaniko-engine/executor"):
-                kaniko_binary = "/kaniko-engine/executor"
+                kaniko_original_binary = "/kaniko-engine/executor"
             elif os.path.exists("/kaniko/executor"):
-                kaniko_binary = "/kaniko/executor"
+                kaniko_original_binary = "/kaniko/executor"
 
-        if kaniko_binary:
-            print("Production environment detected. Using Shielded Kaniko...")
+        if kaniko_original_binary:
+            print("Production environment detected. Preparing Kaniko Ghost Engine...")
             
-            # --- Hardware Profiling Output ---
+            # --- THE GHOST ENGINE FIX ---
+            # Run Kaniko from a temporary copy so the kernel doesn't lock the destination path
+            kaniko_original_dir = os.path.dirname(kaniko_original_binary)
+            kaniko_ghost_dir = "/tmp/kaniko-ghost"
+            
+            if not os.path.exists(kaniko_ghost_dir):
+                shutil.copytree(kaniko_original_dir, kaniko_ghost_dir)
+                
+            kaniko_ghost_binary = os.path.join(kaniko_ghost_dir, "executor")
+            os.chmod(kaniko_ghost_binary, 0o755)
+
+            # --- HARDWARE PROFILING ---
             cpu_count = os.cpu_count() or 1
             actual_ram_gb = get_container_memory_gb()
             profile = calculate_hardware_profile(cpu_count, actual_ram_gb)
@@ -131,7 +142,7 @@ def handler(job):
             print(f"vCPUs: {cpu_count} | RAM: {actual_ram_gb:.2f} GB")
             print(f"Assigned Tier: {profile['tier']}")
             print(f"Snapshot Mode: {profile['mode']}")
-            print(f"Safe Build Threads: {profile['threads']} (Prevents Compiler OOM)")
+            print(f"Safe Build Threads: {profile['threads']}")
             print(f"---------------------------------")
             
             docker_config_dir = os.path.join(tmp_dir, ".docker")
@@ -144,18 +155,14 @@ def handler(job):
                 with open(os.path.join(docker_config_dir, "config.json"), "w") as f:
                     json.dump(config_data, f)
             
-            # Dynamically ignore the directory Kaniko lives in to prevent the ETXTBSY error
-            kaniko_engine_dir = os.path.dirname(kaniko_binary)
-            
             kaniko_cmd = [
-                kaniko_binary,
+                kaniko_ghost_binary,
                 "--context", absolute_ctx_path,
                 "--dockerfile", absolute_dockerfile_path,
                 "--destination", full_image_tag,
                 "--use-new-run",              
                 "--compressed-caching=false", 
-                "--ignore-path=/__runpod_shield__", 
-                f"--ignore-path={kaniko_engine_dir}",
+                "--ignore-path=/tmp", # Completely ignores the workspace repo AND the Ghost Engine
                 f"--snapshot-mode={profile['mode']}",
                 "--build-arg", f"MAKEFLAGS=-j{profile['threads']}",
                 "--build-arg", f"NPROC={profile['threads']}",

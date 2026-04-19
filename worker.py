@@ -28,7 +28,7 @@ def handler(job):
     if dh_auth:
         try:
             os.makedirs('/kaniko/.docker', exist_ok=True)
-            # Support both "user:token" and "token" (for Hub, usually user:token)
+            # DockerHub requires base64 encoded "username:password"
             auth_str = base64.b64encode(dh_auth.encode()).decode()
             config = {"auths": {"https://index.docker.io/v1/": {"auth": auth_str}}}
             with open('/kaniko/.docker/config.json', 'w') as f:
@@ -36,19 +36,19 @@ def handler(job):
         except Exception as e:
             print(f"Auth Setup Error: {e}")
 
-    # 4. Construct Git Context
-    # If using a PAT, the most reliable Kaniko format is: git://<token>@github.com/<repo>
+    # 4. Construct Git Context (Fixed for 'gzip: invalid header' error)
+    # Using git:// triggers Kaniko's clone logic instead of tarball download logic
     if gh_auth:
-        # If the secret is "username:token", we just need the token part for the URL username field
+        # Extract token if secret is in 'user:token' format
         token_only = gh_auth.split(':')[-1]
         safe_token = urllib.parse.quote(token_only)
         context_url = f"git://{safe_token}@github.com/{github_repo}#refs/heads/{branch}"
-        print(f"Context: git://[REDACTED]@github.com/{github_repo}#refs/heads/{branch}")
+        print(f"Using Authenticated Git Context: git://[REDACTED]@github.com/{github_repo}")
     else:
-        context_url = f"https://github.com/{github_repo}.git#refs/heads/{branch}"
+        context_url = f"git://github.com/{github_repo}#refs/heads/{branch}"
+        print(f"Using Public Git Context: {context_url}")
 
     # 5. Build Kaniko Arguments
-    # We use list format to avoid shell injection and quoting issues
     cmd = [
         "/kaniko/executor",
         "--context", context_url,
@@ -57,15 +57,14 @@ def handler(job):
         "--force"
     ]
 
-    # Add optional sub-path if provided
-    if build_ctx_path:
+    # Only add sub-path if it's explicitly provided to avoid empty flag errors
+    if build_ctx_path and build_ctx_path.strip():
         cmd.extend(["--context-sub-path", build_ctx_path])
 
     print(f"Running Kaniko with args: {cmd}")
 
-    # 6. Execution
+    # 6. Execution and Log Streaming
     try:
-        # capture_output=False so it streams to RunPod system logs automatically
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -76,23 +75,28 @@ def handler(job):
 
         logs = []
         for line in process.stdout:
+            # This streams logs to the RunPod Pod Logs in real-time
             print(line, end='')
             logs.append(line)
         
         process.wait()
 
         if process.returncode == 0:
-            return {"status": "success", "image": f"{dockerhub_repo}:{dockerhub_tag}"}
+            return {
+                "status": "success", 
+                "image": f"{dockerhub_repo}:{dockerhub_tag}"
+            }
         else:
-            # Return the last few lines of the actual error to RunPod
-            error_snippet = "".join(logs[-10:]) if logs else "No logs captured."
+            # Capture last few lines of the log to help diagnose registry or build errors
+            error_snippet = "".join(logs[-15:]) if logs else "No logs captured."
             return {
                 "status": "error", 
-                "message": f"Exit Code {process.returncode}",
+                "message": f"Kaniko exited with code {process.returncode}",
                 "details": error_snippet
             }
 
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Internal Script Error: {str(e)}"}
 
+# Start the RunPod worker
 runpod.serverless.start({"handler": handler})

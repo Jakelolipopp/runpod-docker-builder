@@ -21,12 +21,41 @@ def parse_auth_env(env_name):
                 auth_map[user.strip()] = token.strip()
     return auth_map
 
+# --- Logging Helpers ---
+def log(message, level="INFO", job_id="SYSTEM"):
+    print(f"[{level}] {job_id} | {message}", flush=True)
+
+def run_command_streaming(cmd, env=None, job_id="BUILD"):
+    log(f"Executing: {' '.join(cmd)}", job_id=job_id)
+    process = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+    
+    output_lines = []
+    for line in iter(process.stdout.readline, ""):
+        # We print directly to stdout for real-time visibility in RunPod logs
+        print(f"  {line}", end="", flush=True)
+        output_lines.append(line)
+    
+    process.stdout.close()
+    return_code = process.wait()
+    return return_code, "".join(output_lines)
+
 # --- The Main Handler ---
 def handler(job):
+    job_id = job.get('id', 'unknown')
     job_input = job['input']
+    
+    log("Job Received.", job_id=job_id)
     
     github_repo = job_input.get('github_repo')
     if not github_repo:
+        log("Error: Missing github_repo", "ERROR", job_id)
         return {"error": "Missing 'github_repo' in input."}
     
     branch = job_input.get('branch', 'main')
@@ -36,21 +65,29 @@ def handler(job):
     
     dockerhub_repo = job_input.get('dockerhub_repo')
     if not dockerhub_repo:
+        log("Error: Missing dockerhub_repo", "ERROR", job_id)
         return {"error": "Missing 'dockerhub_repo' in input."}
     
     dockerhub_tag = job_input.get('dockerhub_tag', 'latest')
     dockerhub_token = job_input.get('dockerhub_access_token')
     
+    log(f"Target: {dockerhub_repo}:{dockerhub_tag}", job_id=job_id)
+    log(f"Source: {github_repo} (branch: {branch})", job_id=job_id)
+
     gh_auth_map = parse_auth_env('github_pat_auth')
     dh_auth_map = parse_auth_env('dockerhub_pat_auth')
     
     if not github_token:
         repo_owner = github_repo.split('/')[0]
         github_token = gh_auth_map.get(repo_owner)
+        if github_token:
+            log("GitHub token retrieved from environment secrets.", job_id=job_id)
         
     dh_user = dockerhub_repo.split('/')[0]
     if not dockerhub_token:
         dockerhub_token = dh_auth_map.get(dh_user)
+        if dockerhub_token:
+            log("DockerHub token retrieved from environment secrets.", job_id=job_id)
 
     full_image_tag = f"{dockerhub_repo}:{dockerhub_tag}"
     
@@ -60,15 +97,19 @@ def handler(job):
     shield_workspace = "/__runpod_shield__/workspace"
     os.makedirs(shield_workspace, exist_ok=True)
     
+    log(f"Preparing workspace in {shield_workspace}...", job_id=job_id)
+    
     with tempfile.TemporaryDirectory(dir=shield_workspace) as tmp_dir:
         repo_dir = os.path.join(tmp_dir, "repo")
         clone_url = f"https://{github_token}@github.com/{github_repo}.git" if github_token else f"https://github.com/{github_repo}.git"
             
-        print(f"Cloning {github_repo} (branch: {branch})...")
+        log(f"Cloning repository...", job_id=job_id)
         try:
             # OPTIMIZATION: Shallow clone (depth=1) speeds up download significantly
             Repo.clone_from(clone_url, repo_dir, branch=branch, depth=1)
+            log("Clone successful.", job_id=job_id)
         except Exception as e:
+            log(f"Clone failed: {str(e)}", "ERROR", job_id)
             return {"error": f"Failed to clone repository: {str(e)}"}
         
         absolute_ctx_path = os.path.abspath(os.path.join(repo_dir, build_ctx_path))
@@ -80,12 +121,13 @@ def handler(job):
         
         # Check for the updated kaniko-engine path
         if os.path.exists("/kaniko-engine/executor"):
-            print("Production environment detected. Using Shielded Kaniko...")
+            log("Production environment (Shielded Kaniko) detected.", job_id=job_id)
             
             docker_config_dir = os.path.join(tmp_dir, ".docker")
             os.makedirs(docker_config_dir, exist_ok=True)
             
             if dockerhub_token:
+                log("Configuring DockerHub credentials...", job_id=job_id)
                 auth_string = f"{dh_user}:{dockerhub_token}"
                 encoded_auth = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
                 config_data = {"auths": {"https://index.docker.io/v1/": {"auth": encoded_auth}}}
@@ -94,6 +136,7 @@ def handler(job):
             
             # OPTIMIZATION: Hardcoded for known hardware environment
             cpu_count = 16
+            log(f"Allocating {cpu_count} vCPUs for the build pipeline.", job_id=job_id)
             
             kaniko_cmd = [
                 "/kaniko-engine/executor",
@@ -107,51 +150,56 @@ def handler(job):
                 "--build-arg", f"MAKEFLAGS=-j{cpu_count}",
                 "--build-arg", f"NPROC={cpu_count}",
                 "--build-arg", f"MAX_JOBS={cpu_count}",
-                "--snapshot-mode=redo" # OPTIMIZATION: Explicitly use high-RAM redo mode
+                "--snapshot-mode=redo"
             ]
             
             env = os.environ.copy()
             env["DOCKER_CONFIG"] = docker_config_dir
-            # OPTIMIZATION: Maximum concurrency for Go execution
             env["GOMAXPROCS"] = str(cpu_count)
-            # OPTIMIZATION: Delay Garbage Collection to utilize the 32GB RAM for faster builds
             env["GOGC"] = "1000"
-            # OPTIMIZATION: Soft memory limit to prevent Go from utilizing 100% of RAM and crashing
             env["GOMEMLIMIT"] = "28000MiB"
 
-            build_proc = subprocess.run(kaniko_cmd, env=env, capture_output=True, text=True)
+            log("Starting Kaniko build/push process...", job_id=job_id)
+            rc, build_log = run_command_streaming(kaniko_cmd, env=env, job_id=job_id)
             
-            if build_proc.returncode != 0:
-                return {"success": False, "error": "Kaniko build/push failed", "stdout": build_proc.stdout, "stderr": build_proc.stderr}
+            if rc != 0:
+                log("Kaniko execution failed.", "ERROR", job_id)
+                return {"success": False, "error": "Kaniko build/push failed", "build_log": build_log}
                 
-            return {"success": True, "message": f"Successfully built and pushed {full_image_tag} via Kaniko", "build_log": build_proc.stdout}
+            log("Build and push completed successfully.", job_id=job_id)
+            return {"success": True, "message": f"Successfully built and pushed {full_image_tag} via Kaniko", "build_log": build_log}
 
         else:
-            print("Local environment detected. Falling back to host Docker daemon...")
+            log("Local environment detected. Falling back to host Docker daemon...", job_id=job_id)
             if not shutil.which("docker"):
+                log("Docker not found in path.", "ERROR", job_id)
                 return {"success": False, "error": "Neither Kaniko nor Docker was found. Cannot build image."}
 
             if dockerhub_token:
-                print("Logging into DockerHub locally...")
+                log("Logging into DockerHub locally...", job_id=job_id)
                 login_cmd = ["docker", "login", "-u", dh_user, "--password-stdin"]
                 login_proc = subprocess.run(login_cmd, input=dockerhub_token, capture_output=True, text=True)
                 if login_proc.returncode != 0:
+                    log("Local Docker login failed.", "ERROR", job_id)
                     return {"success": False, "error": "Local Docker login failed", "stderr": login_proc.stderr}
 
-            print(f"Building {full_image_tag} locally...")
+            log(f"Building {full_image_tag} locally...", job_id=job_id)
             build_cmd = ["docker", "build", "-t", full_image_tag, "-f", absolute_dockerfile_path, absolute_ctx_path]
-            build_proc = subprocess.run(build_cmd, capture_output=True, text=True)
-            if build_proc.returncode != 0:
-                return {"success": False, "error": "Local Docker build failed", "stderr": build_proc.stderr}
+            rc, build_log = run_command_streaming(build_cmd, job_id=job_id)
+            if rc != 0:
+                log("Local build failed.", "ERROR", job_id)
+                return {"success": False, "error": "Local Docker build failed", "build_log": build_log}
 
-            print(f"Pushing {full_image_tag} locally...")
+            log(f"Pushing {full_image_tag} locally...", job_id=job_id)
             push_cmd = ["docker", "push", full_image_tag]
-            push_proc = subprocess.run(push_cmd, capture_output=True, text=True)
-            if push_proc.returncode != 0:
-                return {"success": False, "error": "Local Docker push failed", "stderr": push_proc.stderr}
+            rc, push_log = run_command_streaming(push_cmd, job_id=job_id)
+            if rc != 0:
+                log("Local push failed.", "ERROR", job_id)
+                return {"success": False, "error": "Local Docker push failed", "build_log": push_log}
 
-            return {"success": True, "message": f"Successfully built and pushed {full_image_tag} via Local Docker", "build_log": build_proc.stdout}
+            log("Local build and push complete.", job_id=job_id)
+            return {"success": True, "message": f"Successfully built and pushed {full_image_tag} via Local Docker", "build_log": build_log}
 
 if __name__ == "__main__":
-    print("RunPod Auto-Builder Worker Started.")
+    log("RunPod Auto-Builder Worker Started.", level="INFO")
     runpod.serverless.start({"handler": handler})

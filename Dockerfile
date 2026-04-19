@@ -10,6 +10,10 @@ RUN apt-get update && apt-get install -y \
     uidmap \
     && rm -rf /var/lib/apt/lists/*
 
+# Set Buildah to use chroot isolation globally.
+# This prevents 'unshare' errors in restricted container environments.
+ENV BUILDAH_ISOLATION=chroot
+
 # Set the working directory
 WORKDIR /
 

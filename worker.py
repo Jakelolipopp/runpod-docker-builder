@@ -47,12 +47,17 @@ def run_command(command, input_str=None):
     """
     Executes a shell command and returns (stdout, stderr, returncode).
     """
+    # Merge current environment with BUILDAH_ISOLATION
+    env = os.environ.copy()
+    env["BUILDAH_ISOLATION"] = "chroot"
+    
     result = subprocess.run(
         command,
         input=input_str,
         capture_output=True,
         text=True,
-        shell=False # Using list for security
+        shell=False,
+        env=env # Force isolation mode for all commands
     )
     return result.stdout, result.stderr, result.returncode
 
@@ -129,6 +134,7 @@ def handler(job):
             login_cmd = [
                 "buildah", "login", 
                 "--storage-driver", "vfs",
+                "--isolation", "chroot",
                 "-u", dh_user, 
                 "--password-stdin", "docker.io"
             ]
@@ -184,6 +190,7 @@ def handler(job):
         push_cmd = [
             "buildah", "push",
             "--storage-driver", "vfs",
+            "--isolation", "chroot",
             "--compression-format", "zstd", # Multi-threaded, high-performance compression
             "--threads", str(cpu_count),    # Use all cores for compression
             full_image_tag,

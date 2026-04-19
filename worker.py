@@ -111,8 +111,7 @@ def handler(job):
         # ---------------------------------------------------------
         # ENVIRONMENT ROUTING: Dynamic Engine Locator
         # ---------------------------------------------------------
-        # Dynamically hunt down the Kaniko binary so it never breaks 
-        # if the Dockerfile changes its installation path.
+        # Dynamically hunt down the Kaniko binary. 
         kaniko_binary = shutil.which("executor")
         if not kaniko_binary:
             if os.path.exists("/kaniko-engine/executor"):

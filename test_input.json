@@ -1,0 +1,7 @@
+{
+    "input": {
+        "github_repo": "Jakelolipopp/runpod-docker-builder",
+        "dockerhub_repo": "jakeiolipopp/runpod-docker-builder",
+        "dockerhub_tag": "0.0.1"
+    }
+}
